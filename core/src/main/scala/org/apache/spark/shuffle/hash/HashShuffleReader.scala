@@ -17,31 +17,28 @@
 
 package org.apache.spark.shuffle.hash
 
-import org.apache.spark.{InterruptibleIterator, MapOutputTracker, SparkEnv, TaskContext}
 import org.apache.spark.serializer.Serializer
 import org.apache.spark.shuffle.{BaseShuffleHandle, ShuffleReader}
-import org.apache.spark.storage.BlockManager
-import org.apache.spark.util.CompletionIterator
 import org.apache.spark.util.collection.ExternalSorter
+import org.apache.spark.{InterruptibleIterator, SparkEnv, TaskContext}
 
 private[spark] class HashShuffleReader[K, C](
     handle: BaseShuffleHandle[K, _, C],
     startPartition: Int,
     endPartition: Int,
-    context: TaskContext,
-    blockManager: BlockManager = SparkEnv.get.blockManager,
-    mapOutputTracker: MapOutputTracker = SparkEnv.get.mapOutputTracker)
+    context: TaskContext)
   extends ShuffleReader[K, C]
 {
   require(endPartition == startPartition + 1,
     "Hash shuffle currently only supports fetching one partition")
 
   private val dep = handle.dependency
+  private val blockManager = SparkEnv.get.blockManager
 
   /** Read the combined key-values for this reduce task */
   override def read(): Iterator[Product2[K, C]] = {
     val blockStreams = BlockStoreShuffleFetcher.fetchBlockStreams(
-      handle.shuffleId, startPartition, context, blockManager, mapOutputTracker)
+                       handle.shuffleId, startPartition, context)
 
     // Wrap the streams for compression based on configuration
     val wrappedStreams = blockStreams.map { case (blockId, inputStream) =>
@@ -52,40 +49,30 @@ private[spark] class HashShuffleReader[K, C](
     val serializerInstance = ser.newInstance()
 
     // Create a key/value iterator for each stream
-    val recordIter = wrappedStreams.flatMap { wrappedStream =>
-      // Note: the asKeyValueIterator below wraps a key/value iterator inside of a
-      // NextIterator. The NextIterator makes sure that close() is called on the
-      // underlying InputStream when all records have been read.
+    val recordIterator = wrappedStreams.flatMap { wrappedStream =>
       serializerInstance.deserializeStream(wrappedStream).asKeyValueIterator
     }
 
-    // Update the context task metrics for each record read.
-    val readMetrics = context.taskMetrics.createShuffleReadMetricsForDependency()
-    val metricIter = CompletionIterator[(Any, Any), Iterator[(Any, Any)]](
-      recordIter.map(record => {
-        readMetrics.incRecordsRead(1)
-        record
-      }),
-      context.taskMetrics().updateShuffleReadMetrics())
-
-    // An interruptible iterator must be used here in order to support task cancellation
-    val interruptibleIter = new InterruptibleIterator[(Any, Any)](context, metricIter)
+    // Update read metrics for each record materialized
+    val iter = new InterruptibleIterator[Any](context, recordIterator) {
+     val readMetrics = context.taskMetrics.createShuffleReadMetricsForDependency()
+     override def next(): Any = {
+       readMetrics.incRecordsRead(1)
+       delegate.next()
+     }
+    }.asInstanceOf[Iterator[Nothing]]
 
     val aggregatedIter: Iterator[Product2[K, C]] = if (dep.aggregator.isDefined) {
       if (dep.mapSideCombine) {
-        // We are reading values that are already combined
-        val combinedKeyValuesIterator = interruptibleIter.asInstanceOf[Iterator[(K, C)]]
-        dep.aggregator.get.combineCombinersByKey(combinedKeyValuesIterator, context)
+        new InterruptibleIterator(context, dep.aggregator.get.combineCombinersByKey(iter, context))
       } else {
-        // We don't know the value type, but also don't care -- the dependency *should*
-        // have made sure its compatible w/ this aggregator, which will convert the value
-        // type to the combined type C
-        val keyValuesIterator = interruptibleIter.asInstanceOf[Iterator[(K, Nothing)]]
-        dep.aggregator.get.combineValuesByKey(keyValuesIterator, context)
+        new InterruptibleIterator(context, dep.aggregator.get.combineValuesByKey(iter, context))
       }
     } else {
       require(!dep.mapSideCombine, "Map-side combine without Aggregator specified!")
-      interruptibleIter.asInstanceOf[Iterator[Product2[K, C]]]
+
+      // Convert the Product2s to pairs since this is what downstream RDDs currently expect
+      iter.asInstanceOf[Iterator[Product2[K, C]]].map(pair => (pair._1, pair._2))
     }
 
     // Sort the output if there is a sort ordering defined.

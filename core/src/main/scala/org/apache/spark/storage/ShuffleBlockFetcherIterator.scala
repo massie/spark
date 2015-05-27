@@ -20,13 +20,14 @@ package org.apache.spark.storage
 import java.io.InputStream
 import java.util.concurrent.LinkedBlockingQueue
 
-import scala.collection.mutable.{ArrayBuffer, HashSet, Queue}
+import scala.collection.mutable
+import scala.collection.mutable.ArrayBuffer
 import scala.util.{Failure, Try}
 
-import org.apache.spark.{Logging, TaskContext}
 import org.apache.spark.network.buffer.ManagedBuffer
 import org.apache.spark.network.shuffle.{BlockFetchingListener, ShuffleClient}
 import org.apache.spark.util.Utils
+import org.apache.spark.{Logging, TaskContext}
 
 /**
  * An iterator that fetches multiple blocks. For local blocks, it fetches from the local block
@@ -77,7 +78,7 @@ final class ShuffleBlockFetcherIterator(
   private[this] val localBlocks = new ArrayBuffer[BlockId]()
 
   /** Remote blocks to fetch, excluding zero-sized blocks. */
-  private[this] val remoteBlocks = new HashSet[BlockId]()
+  private[this] val remoteBlocks = new mutable.HashSet[BlockId]()
 
   /**
    * A queue to hold our results. This turns the asynchronous model provided by
@@ -95,7 +96,7 @@ final class ShuffleBlockFetcherIterator(
    * Queue of fetch requests to issue; we'll pull requests off this gradually to make sure that
    * the number of bytes in flight is limited to maxBytesInFlight.
    */
-  private[this] val fetchRequests = new Queue[FetchRequest]
+  private[this] val fetchRequests = new mutable.Queue[FetchRequest]
 
   /** Current bytes in flight from our requests */
   private[this] var bytesInFlight = 0L
@@ -274,12 +275,6 @@ final class ShuffleBlockFetcherIterator(
 
   override def hasNext: Boolean = numBlocksProcessed < numBlocksToFetch
 
-  /**
-   * Fetches the next (BlockId, Try[InputStream]). If a task fails, the ManagedBuffers
-   * underlying each InputStream will be freed by the cleanup() method registered with the
-   * TaskCompletionListener. However, callers should close() these InputStreams
-   * as soon as they are no longer needed, in order to release memory as early as possible.
-   */
   override def next(): (BlockId, Try[InputStream]) = {
     numBlocksProcessed += 1
     val startFetchWait = System.currentTimeMillis()
@@ -306,7 +301,7 @@ final class ShuffleBlockFetcherIterator(
         // not exist, SPARK-4085). In that case, we should propagate the right exception so
         // the scheduler gets a FetchFailedException.
         Try(buf.createInputStream()).map { inputStream =>
-          new BufferReleasingInputStream(inputStream, this)
+          new WrappedInputStream(inputStream, this)
         }
     }
 
@@ -314,14 +309,10 @@ final class ShuffleBlockFetcherIterator(
   }
 }
 
-/**
- * Helper class that ensures a ManagedBuffer is release upon InputStream.close()
- */
-private class BufferReleasingInputStream(
-    private val delegate: InputStream,
-    private val iterator: ShuffleBlockFetcherIterator)
+// Helper class that ensures a ManagerBuffer is released upon InputStream.close()
+private class WrappedInputStream(delegate: InputStream, iterator: ShuffleBlockFetcherIterator)
   extends InputStream {
-  private[this] var closed = false
+  private var closed = false
 
   override def read(): Int = delegate.read()
 
