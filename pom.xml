@@ -1100,6 +1100,12 @@
         <scope>${parquet.deps.scope}</scope>
       </dependency>
       <dependency>
+	    <groupId>org.apache.parquet</groupId>
+		<artifactId>parquet-avro</artifactId>
+		<version>${parquet.version}</version>
+		<scope>${parquet.deps.scope}</scope>
+      </dependency>
+      <dependency>
         <groupId>org.apache.flume</groupId>
         <artifactId>flume-ng-core</artifactId>
         <version>${flume.version}</version>

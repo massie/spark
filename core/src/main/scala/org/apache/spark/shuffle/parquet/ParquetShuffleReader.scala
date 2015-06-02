@@ -14,62 +14,76 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+package org.apache.spark.shuffle.parquet
 
-package org.apache.spark.shuffle.hash
+import java.nio.file.Files
 
-import org.apache.spark.{InterruptibleIterator, MapOutputTracker, SparkEnv, TaskContext}
+import org.apache.hadoop.fs.Path
+import org.apache.parquet.avro.AvroParquetReader
+
 import org.apache.spark.serializer.Serializer
-import org.apache.spark.shuffle.{BaseShuffleHandle, ShuffleReader}
+import org.apache.spark.shuffle.hash.BlockStoreShuffleFetcher
+import org.apache.spark.shuffle.parquet.avro.AvroPair
+
+import org.apache.spark.shuffle.ShuffleReader
 import org.apache.spark.storage.BlockManager
 import org.apache.spark.util.CompletionIterator
 import org.apache.spark.util.collection.ExternalSorter
+import org.apache.spark._
 
-private[spark] class HashShuffleReader[K, C](
-    handle: BaseShuffleHandle[K, _, C],
+class ParquetShuffleReader[K, V, C](
+    handle: ParquetShuffleHandle[K, _, C],
     startPartition: Int,
     endPartition: Int,
     context: TaskContext,
     blockManager: BlockManager = SparkEnv.get.blockManager,
     mapOutputTracker: MapOutputTracker = SparkEnv.get.mapOutputTracker)
-  extends ShuffleReader[K, C]
-{
+  extends ShuffleReader[K, C] with Logging {
   require(endPartition == startPartition + 1,
-    "Hash shuffle currently only supports fetching one partition")
+    "Parquet shuffle currently only supports fetching one partition")
 
   private val dep = handle.dependency
+  private val shuffleId = handle.shuffleId
+  private val reduceId = startPartition
 
   /** Read the combined key-values for this reduce task */
   override def read(): Iterator[Product2[K, C]] = {
     val blockStreams = BlockStoreShuffleFetcher.fetchBlockStreams(
       handle.shuffleId, startPartition, context, blockManager, mapOutputTracker)
 
-    // Wrap the streams for compression based on configuration
-    val wrappedStreams = blockStreams.map { case (blockId, inputStream) =>
-      blockManager.wrapForCompression(blockId, inputStream)
-    }
+    val readMetrics = context.taskMetrics().createShuffleReadMetricsForDependency()
 
-    val ser = Serializer.getSerializer(dep.serializer)
-    val serializerInstance = ser.newInstance()
-
-    // Create a key/value iterator for each stream
-    val recordIter = wrappedStreams.flatMap { wrappedStream =>
-      // Note: the asKeyValueIterator below wraps a key/value iterator inside of a
-      // NextIterator. The NextIterator makes sure that close() is called on the
-      // underlying InputStream when all records have been read.
-      serializerInstance.deserializeStream(wrappedStream).asKeyValueIterator
-    }
-
-    // Update the context task metrics for each record read.
-    val readMetrics = context.taskMetrics.createShuffleReadMetricsForDependency()
-    val metricIter = CompletionIterator[(Any, Any), Iterator[(Any, Any)]](
-      recordIter.map(record => {
-        readMetrics.incRecordsRead(1)
-        record
-      }),
-      context.taskMetrics().updateShuffleReadMetrics())
+    val recordIterator = CompletionIterator[Product2[Any, Any],
+      Iterator[Product2[Any, Any]]](
+        for ((blockId, inputStream) <- blockStreams;
+             record <- {
+               // Parquet needs to work with Files instead of InputStreams, so we
+               // (1) Request a local, temporary block for the remote data
+               val (tBlockId, tBlock) = blockManager.diskBlockManager.createTempLocalBlock()
+               // (2) Copy all data from the InputStream to the local, temporary block File
+               Files.copy(inputStream, tBlock.toPath)
+               // (3) Close the InputStream, and
+               inputStream.close()
+               // (4) Load the Parquet data from the temporary block File
+               val reader = new AvroParquetReader[AvroPair[Any, Any]](
+                 new Path(tBlock.getCanonicalPath))
+               val iterator = Iterator.continually(reader.read()).takeWhile(_ != null)
+               CompletionIterator[Product2[Any, Any], Iterator[Product2[Any, Any]]](iterator, {
+                 // Once all the records are read, close the reader and input stream as soon as
+                 // possible, to allow a release of the underlying ManagedBuffer memory
+                 reader.close()
+                 inputStream.close()
+               })
+             }) yield {
+          // Update the read metrics for each record that is read
+          readMetrics.incRecordsRead(1)
+          record
+        },
+        // When the iterator completes, update all the shuffle metrics
+        context.taskMetrics().updateShuffleReadMetrics())
 
     // An interruptible iterator must be used here in order to support task cancellation
-    val interruptibleIter = new InterruptibleIterator[(Any, Any)](context, metricIter)
+    val interruptibleIter = new InterruptibleIterator[Product2[Any, Any]](context, recordIterator)
 
     val aggregatedIter: Iterator[Product2[K, C]] = if (dep.aggregator.isDefined) {
       if (dep.mapSideCombine) {
@@ -93,6 +107,8 @@ private[spark] class HashShuffleReader[K, C](
       case Some(keyOrd: Ordering[K]) =>
         // Create an ExternalSorter to sort the data. Note that if spark.shuffle.spill is disabled,
         // the ExternalSorter won't spill to disk.
+        // TODO: revisit this. Serializer will be record-oriented which isn't ideal.
+        val ser = Serializer.getSerializer(dep.serializer)
         val sorter = new ExternalSorter[K, C, C](ordering = Some(keyOrd), serializer = Some(ser))
         sorter.insertAll(aggregatedIter)
         context.taskMetrics.incMemoryBytesSpilled(sorter.memoryBytesSpilled)

@@ -51,8 +51,8 @@ import org.apache.spark.util.random.StratifiedSamplingUtils
 /**
  * Extra functions available on RDDs of (key, value) pairs through an implicit conversion.
  */
-class PairRDDFunctions[K, V](self: RDD[(K, V)])
-    (implicit kt: ClassTag[K], vt: ClassTag[V], ord: Ordering[K] = null)
+class PairRDDFunctions[K: ClassTag, V: ClassTag](self: RDD[(K, V)])
+    (implicit ord: Ordering[K] = null)
   extends Logging
   with SparkHadoopMapReduceUtil
   with Serializable
@@ -70,7 +70,7 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
    * In addition, users can control the partitioning of the output RDD, and whether to perform
    * map-side aggregation (if a mapper can produce multiple items with the same key).
    */
-  def combineByKey[C](createCombiner: V => C,
+  def combineByKey[C: ClassTag](createCombiner: V => C,
       mergeValue: (C, V) => C,
       mergeCombiners: (C, C) => C,
       partitioner: Partitioner,
@@ -105,7 +105,7 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
   /**
    * Simplified version of combineByKey that hash-partitions the output RDD.
    */
-  def combineByKey[C](createCombiner: V => C,
+  def combineByKey[C: ClassTag](createCombiner: V => C,
       mergeValue: (C, V) => C,
       mergeCombiners: (C, C) => C,
       numPartitions: Int): RDD[(K, C)] = self.withScope {
@@ -568,7 +568,8 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
    * Simplified version of combineByKey that hash-partitions the resulting RDD using the
    * existing partitioner/parallelism level.
    */
-  def combineByKey[C](createCombiner: V => C, mergeValue: (C, V) => C, mergeCombiners: (C, C) => C)
+  def combineByKey[C: ClassTag](createCombiner: V => C, mergeValue: (C, V) => C,
+                                mergeCombiners: (C, C) => C)
     : RDD[(K, C)] = self.withScope {
     combineByKey(createCombiner, mergeValue, mergeCombiners, defaultPartitioner(self))
   }
@@ -1152,9 +1153,9 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
    */
   def values: RDD[V] = self.map(_._2)
 
-  private[spark] def keyClass: Class[_] = kt.runtimeClass
+  private[spark] def keyClass: Class[_] = reflect.classTag[K].runtimeClass
 
-  private[spark] def valueClass: Class[_] = vt.runtimeClass
+  private[spark] def valueClass: Class[_] = reflect.classTag[V].runtimeClass
 
   private[spark] def keyOrdering: Option[Ordering[K]] = Option(ord)
 
